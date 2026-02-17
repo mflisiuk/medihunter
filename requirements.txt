@@ -6,4 +6,5 @@ xmpppy==0.6.2
 python-dotenv==0.19.2
 appdirs==1.4.4
 fake-useragent==1.2.1
-lxml==4.9.1
+# lxml pinned version was too old for Python 3.14 wheels; keep a compatible one
+lxml==6.0.2

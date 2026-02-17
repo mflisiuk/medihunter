@@ -1,18 +1,35 @@
+import base64
+import hashlib
 import json
 import os
 import pickle
+import re
+import urllib.parse
 from collections import namedtuple, deque
 from datetime import datetime, timedelta
 
 import appdirs
 import requests
 from bs4 import BeautifulSoup
+
+from medicover_browser_auth import load_tokens, login_and_capture_tokens, save_tokens
+
 from fake_useragent import UserAgent
 
-BASE_HOST = "mol.medicover.pl"
-BASE_URL = "https://"+BASE_HOST
+# NOTE(2026-02): Medicover moved auth to login-online24 + oauth.medicover.pl (OIDC Code + PKCE).
+# Portal UI runs on online24.
+BASE_HOST = "online24.medicover.pl"
+BASE_URL = "https://" + BASE_HOST
 
+# OIDC / OAuth broker
 BASE_OAUTH_URL = "https://oauth.medicover.pl"
+
+# New login UI host (also hosts some user/profile APIs)
+BASE_LOGIN_HOST = "login-online24.medicover.pl"
+BASE_LOGIN_URL = "https://" + BASE_LOGIN_HOST
+
+# API Gateway for appointments search
+BASE_API_GATEWAY = "https://api-gateway-online24.medicover.pl"
 
 ua = UserAgent()
 USER_AGENT = ua.random
@@ -24,14 +41,15 @@ Appointment = namedtuple(
 
 
 class MedicoverSession:
-    """
-    Creating (log_in) and killing (log_out) session.
-    """
+    """Creating (log_in) and killing (log_out) session."""
 
     def __init__(self, username, password):
         self.username = username
         self.password = password
         self.session = requests.Session()
+        self.access_token = None
+        self.refresh_token = None
+        self.token_expires_at = None
         self.headers = {
             "User-Agent": USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -55,14 +73,30 @@ class MedicoverSession:
             pass
 
     def extract_data_from_login_form(self, page_text: str):
-        """ Extract values from input fields and prepare data for login request. """
-        data = {"UserName": self.username, "Password": self.password}
+        """Extract values from input fields and prepare data for login request.
+
+        New login UI (login-online24) expects form fields like:
+        - Input.Username, Input.Password, __RequestVerificationToken
+        - Input.ReturnUrl, Input.LoginType, Input.Button
+        """
         soup = BeautifulSoup(page_text, "html.parser")
-        for input_tag in soup.find_all("input"):
-            if input_tag["name"] == "ReturnUrl":
-                data["ReturnUrl"] = input_tag["value"]
-            elif input_tag["name"] == "__RequestVerificationToken":
-                data["__RequestVerificationToken"] = input_tag["value"]
+
+        def _get_input(name: str):
+            tag = soup.find("input", attrs={"name": name})
+            return tag.get("value") if tag else None
+
+        return_url = _get_input("Input.ReturnUrl") or _get_input("ReturnUrl")
+        vtoken = _get_input("__RequestVerificationToken")
+
+        data = {
+            "Input.ReturnUrl": return_url or "",
+            "Input.LoginType": "FullLogin",
+            "Input.Username": self.username,
+            "Input.Password": self.password,
+            "Input.Button": "login",
+            "__RequestVerificationToken": vtoken or "",
+            "Input.IsSimpleAccessRegulationAccepted": "false",
+        }
         return data
 
     def extract_data_from_mfa_form(self, page_text: str, code: str):
@@ -91,129 +125,146 @@ class MedicoverSession:
                 data["session_state"] = input_tag["value"]
         return data
 
+    def _pkce_verifier(self, nbytes: int = 32) -> str:
+        # RFC 7636: code_verifier is high-entropy cryptographic random string.
+        return base64.urlsafe_b64encode(os.urandom(nbytes)).decode().rstrip("=")
+
+    def _pkce_challenge_s256(self, verifier: str) -> str:
+        digest = hashlib.sha256(verifier.encode()).digest()
+        return base64.urlsafe_b64encode(digest).decode().rstrip("=")
+
+    def _extract_return_url_from_login_url(self, login_url: str) -> str:
+        parsed = urllib.parse.urlparse(login_url)
+        qs = urllib.parse.parse_qs(parsed.query)
+        return qs.get("ReturnUrl", [""])[0]
+
     def oauth_sign_in(self, page_text):
-        """
-        Helper function allowing to extract oauth link from page content
-        """
+        """Legacy helper (kept for compatibility)."""
         soup = BeautifulSoup(page_text, "html.parser")
-        return soup.form["action"]
+        return soup.form["action"] if soup.form else None
 
     def log_in(self):
-        """Login to Medicover website"""
+        """Login to Medicover online24 (request-only).
+
+        Current flow (2026): OIDC Code + PKCE handled by login-online24.
+        We emulate browser navigation to obtain authenticated cookies on online24.
+        """
         self.load_cookies()
 
-        # Check whether a previous session is still valid
-        # 0. GET https://mol.medicover.pl/
-        response = self.session.get(
-            "https://mol.medicover.pl/",
-            headers=self.headers,
-            allow_redirects=False)
+        # Fast path: if we already have a refresh_token, try refreshing access token.
+        # (This won't validate API permissions but avoids unnecessary logins.)
+        if self.refresh_token:
+            try:
+                self._refresh_access_token()
+                return self.session.get(
+                    f"{BASE_LOGIN_URL}/api/v4/available-profiles/me",
+                    headers={"Accept": "application/json", "User-Agent": USER_AGENT, **self._token_headers()},
+                    timeout=15,
+                )
+            except Exception:
+                pass
 
-        if response.status_code == 200:
-            return response
+        # Preferred (stable) path: use real browser (Playwright) once to capture refresh_token.
+        cached = load_tokens(self.username)
+        if cached and cached.get("refresh_token"):
+            self.refresh_token = cached.get("refresh_token")
+            try:
+                self._refresh_access_token()
+                me = self.session.get(
+                    f"{BASE_LOGIN_URL}/api/v4/available-profiles/me",
+                    headers={"Accept": "application/json", "User-Agent": USER_AGENT, "Origin": BASE_URL, "Referer": BASE_URL + "/home", **self._token_headers()},
+                    timeout=20,
+                )
+                me.raise_for_status()
+                return me
+            except Exception:
+                pass
 
-        # 1. GET https://mol.medicover.pl/Users/Account/LogOn?ReturnUrl=%2F
-        response = self.session.get(
-            BASE_URL + "/Users/Account/LogOn?ReturnUrl=%2F",
-            headers=self.headers,
-            allow_redirects=False,
+        # No cached token or refresh failed -> interactive browser login (headless by default)
+        tokens = login_and_capture_tokens(self.username, self.password, headless=True, timeout_sec=180)
+        self.access_token = tokens.get("access_token")
+        self.refresh_token = tokens.get("refresh_token")
+        expires_in = tokens.get("expires_in")
+        if expires_in:
+            self.token_expires_at = datetime.utcnow() + timedelta(seconds=int(expires_in) - 10)
+        save_tokens(self.username, tokens)
+
+        me = self.session.get(
+            f"{BASE_LOGIN_URL}/api/v4/available-profiles/me",
+            headers={"Accept": "application/json", "User-Agent": USER_AGENT, "Origin": BASE_URL, "Referer": BASE_URL + "/home", **self._token_headers()},
+            timeout=20,
         )
-        next_url = response.headers["Location"]
+        me.raise_for_status()
+        return me
 
-        # 2. GET
-        # https://oauth.medicover.pl/connect/authorize?client_id=Mcov_Mol&response_type=code+id_token&scope=openid&redirect_uri=https%3A%2F%2Fmol...
-        response = self.session.get(
-            next_url, headers=self.headers, allow_redirects=False
-        )
-        next_url = response.headers["Location"]
+    def _token_headers(self):
+        if not self.access_token:
+            return {}
+        return {
+            "Authorization": f"Bearer {self.access_token}",
+        }
 
-        # 3. GET
-        # https://oauth.medicover.pl/login?signin=5512f89689e74ce9d5515f6a84d76
-        response = self.session.get(
-            next_url, headers=self.headers, allow_redirects=False
-        )
-        next_referer = next_url
-
-        # 4. GET
-        # https://oauth.medicover.pl/external?provider=IS3&signin=944f8051df4165a710e592dd7f8a&owner=Mcov_Mol&ui_locales=pl-PL
-
-        response = self.session.get(
-            f"{BASE_OAUTH_URL}/external",
-            headers=self.headers.update({"Referer": next_referer}),
-            params={
-                "provider": "IS3",
-                "signin": next_url.split("=")[-1],
-                "owner": "Mcov_Mol",
-                "ui_locales": "pl-PL",
-            },
-            allow_redirects=False,
-        )
-        next_url = response.headers["Location"]
-
-        # 5. GET
-        # https://login.medicover.pl/connect/authorize?client_id=is3&redirect_uri=https%3a%2f%2foauth.medicover.pl...
-
-        response = self.session.get(
-            next_url,
-            headers=self.headers.update({"Referer": next_referer}),
-        )
-
-        data = self.extract_data_from_login_form(response.text)
-        login_url = response.url
-
-        # 6. POST
-        # https://login.medicover.pl/Account/Login?ReturnUrl=%2Fconnect%2Fauthorize%2Fcallback%3Fclient_id%3Dis3...
-        response = self.session.post(login_url, headers=self.headers, data=data)
-
-        if '/Account/mfa?' in response.url:
-            # 6a. POST
-            # https://login.medicover.pl/Account/mfa?ReturnUrl=%2Fconnect%2Fauthorize%2Fcallback%3Fclient_id%3Dis3...
-            code = input("Enter the code received by SMS: ")
-            mfa_url = response.url
-            data = self.extract_data_from_mfa_form(response.text, code)
-            response = self.session.post(mfa_url, headers=self.headers, data=data)
-
-        data = self.form_to_dict(response.text)
-        if not data:
-             raise RuntimeError("Cannot log in. Probably invalid user/pass and/or account locked (for e.g. 15 minutes)")
-
-        # 7. POST
-        response = self.session.post(
-            f"{BASE_OAUTH_URL}/signin-oidc",
-            headers=self.headers,
-            data=data
-            # , allow_redirects=False
-        )
-        data = self.form_to_dict(response.text)
-        next_referer = response.url
-
-        self.headers.update(
-            {
-                "Referer": f"{BASE_OAUTH_URL}/",
-                "Origin": f"{BASE_OAUTH_URL}/",
-                "Host": BASE_HOST,
-                "Content-Type": "application/x-www-form-urlencoded",
-            }
-        )
-        # 8 POST
-        response = self.session.post(
-            BASE_URL+"/Medicover.OpenIdConnectAuthentication/Account/OAuthSignIn",
-            headers=self.headers,
+    def _exchange_code_for_token(self, code: str, code_verifier: str, redirect_uri: str):
+        data = {
+            "grant_type": "authorization_code",
+            "client_id": "web",
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "code_verifier": code_verifier,
+        }
+        resp = self.session.post(
+            f"{BASE_OAUTH_URL}/connect/token",
             data=data,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": USER_AGENT,
+            },
+            timeout=20,
         )
+        resp.raise_for_status()
+        tok = resp.json()
+        self.access_token = tok.get("access_token")
+        self.refresh_token = tok.get("refresh_token")
+        # expires_in is seconds
+        expires_in = tok.get("expires_in")
+        if expires_in:
+            self.token_expires_at = datetime.utcnow() + timedelta(seconds=int(expires_in) - 10)
+        return tok
 
-        del self.headers["Origin"]
-        del self.headers["Content-Type"]
-        self.headers.update(
-            {
-                "Referer": BASE_URL+"/Medicover.OpenIdConnectAuthentication/Account/OAuthSignIn",
-            }
+    def _refresh_access_token(self):
+        if not self.refresh_token:
+            raise RuntimeError("No refresh_token available")
+        data = {
+            "grant_type": "refresh_token",
+            "client_id": "web",
+            "refresh_token": self.refresh_token,
+        }
+        resp = self.session.post(
+            f"{BASE_OAUTH_URL}/connect/token",
+            data=data,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": USER_AGENT,
+            },
+            timeout=20,
         )
-        # 9. GET
-        response = self.session.get(BASE_URL+"/", headers=self.headers)
-        response.raise_for_status()
-        self.save_cookies()
-        return response
+        resp.raise_for_status()
+        tok = resp.json()
+        self.access_token = tok.get("access_token")
+        # some servers rotate refresh_token
+        self.refresh_token = tok.get("refresh_token") or self.refresh_token
+        expires_in = tok.get("expires_in")
+        if expires_in:
+            self.token_expires_at = datetime.utcnow() + timedelta(seconds=int(expires_in) - 10)
+        return tok
+
+    def _ensure_token(self):
+        if self.access_token and self.token_expires_at and datetime.utcnow() < self.token_expires_at:
+            return
+        if self.refresh_token:
+            self._refresh_access_token()
 
     def _parse_search_results(self, result):
         """
@@ -239,93 +290,70 @@ class MedicoverSession:
         )
         return appointment
 
+    def search_appointment_filters(self, region_id: int, specialty_id: int, slot_search_type: str = "Standard"):
+        """Fetch filters data for appointments search (clinics/doctors/languages/etc)."""
+        self._ensure_token()
+        url = f"{BASE_API_GATEWAY}/appointments/api/v2/search-appointments/filters"
+        resp = self.session.get(
+            url,
+            params={
+                "RegionIds": int(region_id),
+                "SlotSearchType": slot_search_type,
+                "SpecialtyIds": int(specialty_id),
+            },
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "Origin": BASE_URL,
+                "Referer": BASE_URL + "/home",
+                "User-Agent": USER_AGENT,
+                **self._token_headers(),
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     def search_appointments(self, *args, **kwargs):
+        """Search free appointment slots (NEW API gateway).
 
-        if not (
-            "clinic" in kwargs
-            and "region" in kwargs
-            and "start_date" in kwargs
-            and "bookingtype" in kwargs
-            and "specialization" in kwargs
-            and "doctor" in kwargs
-        ):
-            return
+        This replaces legacy /api/MyVisits/SearchFreeSlotsToBook.
 
+        Required kwargs: region, specialization, start_date (YYYY-mm-dd)
+        Optional: page, page_size
+        """
+        self._ensure_token()
 
+        region_id = int(kwargs.get("region")) if kwargs.get("region") is not None else None
+        specialty_id = int(kwargs.get("specialization")) if kwargs.get("specialization") is not None else None
+        start_date = kwargs.get("start_date")
+        if not region_id or not specialty_id or not start_date:
+            raise RuntimeError("search_appointments requires region, specialization, start_date")
 
-        headers = {
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Connection": "keep-alive",
-            "Content-Type": "application/json",
-            "Host": BASE_HOST,
-            "Origin": BASE_URL,
-            "User-Agent": USER_AGENT,
-        }
-
-        region_id = int(kwargs["region"])
-        service_ids = (
-            [int(kwargs["specialization"])]
-            if kwargs["bookingtype"] == 2
-            else [int(kwargs["service"])]
+        url = f"{BASE_API_GATEWAY}/appointments/api/v2/search-appointments/slots"
+        page = int(kwargs.get("page") or 1)
+        page_size = int(kwargs.get("page_size") or 5000)
+        resp = self.session.get(
+            url,
+            params={
+                "Page": page,
+                "PageSize": page_size,
+                "RegionIds": region_id,
+                "SlotSearchType": "Standard",
+                "SpecialtyIds": specialty_id,
+                "StartTime": start_date,
+                "isOverbookingSearchDisabled": "false",
+            },
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "Origin": BASE_URL,
+                "Referer": BASE_URL + "/home",
+                "User-Agent": USER_AGENT,
+                **self._token_headers(),
+            },
+            timeout=30,
         )
-        clinic_ids = [kwargs["clinic"]] if kwargs["clinic"] > 0 else []
-        doctor_ids = [kwargs["doctor"]] if kwargs["doctor"] > 0 else []
-
-        disable_phone_search = (
-            kwargs["disable_phone_search"]
-            if "disable_phone_search" in kwargs
-            else False
-        )
-
-        search_params = {
-            "regionIds": [region_id],
-            "serviceTypeId": kwargs["bookingtype"],
-            "serviceIds": service_ids,
-            "clinicIds": clinic_ids,
-            "doctorLanguagesIds": [],
-            "doctorIds": doctor_ids,
-            "searchSince": kwargs["start_date"] + "T00:00:00.000Z",
-            "startTime": kwargs["start_time"],
-            "endTime": kwargs["end_time"],
-            "selectedSpecialties": None,
-            "visitType": "center" if kwargs["bookingtype"] == 1 else 2,
-            "disablePhoneSearch": disable_phone_search,
-        }
-
-        result = self.session.post(
-            f"{BASE_URL}/api/MyVisits/SearchFreeSlotsToBook",
-            json=search_params,
-            params={"language": "pl-PL"},
-            headers=headers,
-        )
-
-        try:
-            appointments = self._parse_search_results(result)
-        except KeyError as exc:
-            return []
-        if kwargs.get("end_date") is not None:
-
-            def is_appointment_before_date(
-                appointment: Appointment, date: datetime
-            ) -> bool:
-                def parse_appointment_datetime_to_datetime(iso_date: str) -> datetime:
-                    return datetime.strptime(iso_date, "%Y-%m-%dT%H:%M:%S")
-
-                def get_end_of_day(dt: datetime) -> datetime:
-                    return dt + timedelta(days=1, microseconds=-1)
-
-                return parse_appointment_datetime_to_datetime(
-                    appointment.appointment_datetime
-                ) <= get_end_of_day(date)
-
-            end_date = datetime.strptime(kwargs["end_date"], "%Y-%m-%d")
-            appointments = [
-                a for a in appointments if is_appointment_before_date(a, end_date)
-            ]
-
-        return appointments
+        resp.raise_for_status()
+        return resp.json()
 
     def load_search_form(self):
         return self.session.get(
@@ -424,48 +452,22 @@ class MedicoverSession:
         return list(appointments)
 
     def load_available_regions(self):
-        """Download available region names and ids."""
-        response = self.session.get(
-            BASE_URL + "/api/MyVisits/SearchFreeSlotsToBook/GetInitialFiltersData",
-                headers={
-                    "Host": BASE_HOST,
-                    "Origin": BASE_URL,
-                    "User-Agent": USER_AGENT,
-                },
-        )
-        response.raise_for_status()
-        response_json = response.json()
-        return response_json["regions"]
+        """Download available region names and ids.
+
+        NOTE: online24 UI no longer exposes the old /api/MyVisits/... JSON endpoints reliably.
+        Regions list can be derived from appointments filters endpoint if needed.
+        For now we keep legacy behavior by raising a clear error.
+        """
+        raise RuntimeError("load_available_regions: legacy endpoint deprecated; use appointments gateway filters")
 
     def load_available_specializations(self, region, bookingtype):
-        """Download available specialization names and ids."""
-        response_json = self._get_filters_data(region=region, bookingtype=bookingtype)
-        return response_json["services"]
+        raise RuntimeError("legacy filters deprecated; use appointments gateway")
 
     def load_available_clinics(self, region, bookingtype, specialization):
-        """Download available clinic names and ids."""
-        response_json = self._get_filters_data(region=region, bookingtype=bookingtype, specialization=specialization)
-        return response_json["clinics"]
+        raise RuntimeError("legacy filters deprecated; use appointments gateway")
 
     def load_available_doctors(self, region, bookingtype, specialization, clinic):
-        """Download available doctor names and ids."""
-        response_json = self._get_filters_data(region=region, bookingtype=bookingtype, specialization=specialization, clinic=clinic)
-        return response_json["doctors"]
+        raise RuntimeError("legacy filters deprecated; use appointments gateway")
 
     def _get_filters_data(self, *args, **kwargs):
-        response = self.session.get(
-            BASE_URL + "/api/MyVisits/SearchFreeSlotsToBook/GetFiltersData",
-            params={
-                "regionIds": kwargs.get("region"),
-                "serviceTypeId": kwargs.get("bookingtype"),
-                "serviceIds": kwargs.get("specialization"),
-                "clinicIds": kwargs.get("clinic"),
-            },
-            headers={
-                "Host": BASE_HOST,
-                "Origin": BASE_URL,
-                "User-Agent": USER_AGENT,
-            },
-        )
-        response.raise_for_status()
-        return response.json()
+        raise RuntimeError("legacy filters deprecated; use appointments gateway")

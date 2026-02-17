@@ -114,3 +114,6 @@ visits.db.dir
 
 #local runs
 /appointments.json
+
+# Debug auth dumps
+debug_auth/
