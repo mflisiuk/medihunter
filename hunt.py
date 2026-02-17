@@ -42,7 +42,9 @@ def _parse_args():
     ap = argparse.ArgumentParser(description="Medihunter v2 — poll for free slots")
     ap.add_argument("--region", required=True, help="Region name, e.g. Warszawa")
     ap.add_argument("--spec", required=True, help="Specialty name, e.g. ginekolog, urolog dorośli")
-    ap.add_argument("--start", default=_today_iso(), help="Start date YYYY-MM-DD (default: today UTC)")
+    ap.add_argument("--start", default=_today_iso(), help="Start date YYYY-MM-DD (default: today)")
+    ap.add_argument("--doctor", help="Doctor name (partial match), e.g. 'Wnętrzak' or 'Iwona Wnętrzak'")
+    ap.add_argument("--doctor-id", type=int, help="Doctor id (exact), e.g. 414656")
     ap.add_argument("--days", type=int, default=14, help="How many days ahead to search (default: 14)")
     ap.add_argument("--interval", type=int, default=60, help="Polling interval in seconds (default: 60)")
     ap.add_argument("--page-size", type=int, default=500, help="Slots page size (default: 500)")
@@ -103,12 +105,15 @@ def iter_dates(start_iso: str, days: int):
 
 
 def slot_key(item: dict) -> str:
+    clinic = (item.get("clinic") or {})
+    doctor = (item.get("doctor") or {})
+    spec = (item.get("specialty") or {})
     return "|".join(
         [
             str(item.get("appointmentDate") or ""),
-            str(item.get("clinicName") or ""),
-            str(item.get("doctorName") or ""),
-            str(item.get("specializationName") or ""),
+            str(clinic.get("id") or ""),
+            str(doctor.get("id") or ""),
+            str(spec.get("id") or ""),
         ]
     )
 
@@ -128,7 +133,36 @@ def main():
 
     seen: set[str] = set()
 
-    print(f"[medihunter] OK. Hunting: region={region_label} ({region_id}), spec={spec_label} ({spec_id}), start={args.start}, days={args.days}, interval={args.interval}s")
+    # Resolve doctor selection (optional)
+    doctor_id = None
+    doctor_label = None
+    if args.doctor_id:
+        doctor_id = int(args.doctor_id)
+        doctor_label = f"id:{doctor_id}"
+    elif args.doctor:
+        # Use filters doctors list to resolve name -> id
+        bootstrap = s.search_appointment_filters(region_id=region_id, specialty_id=spec_id)
+        doctors = bootstrap.get("doctors", []) or []
+        target = None
+        for d in doctors:
+            if _norm(d.get("value", "")) == _norm(args.doctor):
+                target = d
+                break
+        if not target:
+            for d in doctors:
+                if _norm(args.doctor) in _norm(d.get("value", "")):
+                    target = d
+                    break
+        if not target:
+            examples = ", ".join([d.get("value", "") for d in doctors[:10]])
+            raise SystemExit(f"Could not resolve doctor '{args.doctor}'. Examples: {examples}")
+        doctor_id = int(target["id"])
+        doctor_label = target.get("value")
+
+    head = f"[medihunter] OK. Hunting: region={region_label} ({region_id}), spec={spec_label} ({spec_id}), start={args.start}, days={args.days}, interval={args.interval}s"
+    if doctor_id:
+        head += f", doctor={doctor_label} ({doctor_id})"
+    print(head)
     sys.stdout.flush()
 
     while True:
@@ -143,6 +177,15 @@ def main():
             )
             items = resp.get("items", []) or []
             for it in items:
+                # Doctor filter (optional)
+                if doctor_id:
+                    did = ((it.get("doctor") or {}).get("id"))
+                    try:
+                        if int(did) != int(doctor_id):
+                            continue
+                    except Exception:
+                        continue
+
                 k = slot_key(it)
                 if k not in seen:
                     seen.add(k)
@@ -154,8 +197,11 @@ def main():
             else:
                 print(f"[medihunter] FOUND {len(new_items)} new slot(s)")
                 for it in new_items:
+                    clinic = (it.get('clinic') or {})
+                    doctor = (it.get('doctor') or {})
+                    spec = (it.get('specialty') or {})
                     print(
-                        f"  {it.get('appointmentDate')} | {it.get('specializationName')} | {it.get('clinicName')} | {it.get('doctorName')}"
+                        f"  {it.get('appointmentDate')} | {spec.get('name')} | {clinic.get('name')} | {doctor.get('name')} | doctorId={doctor.get('id')}"
                     )
             sys.stdout.flush()
 
