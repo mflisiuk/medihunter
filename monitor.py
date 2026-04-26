@@ -27,7 +27,7 @@ def cmd_login(args):
     """Force re-login via Playwright."""
     if args.card and args.password:
         save_credentials(args.card, args.password)
-    force_login()
+    force_login(fresh=args.relogin)
 
 
 def cmd_specialties(args):
@@ -112,9 +112,9 @@ def cmd_search(args):
 
     for i, s in enumerate(filtered[:50]):
         date = s.get("appointmentDate", "?")
-        doctor = s.get("doctor", {}).get("name", "?")
-        clinic = s.get("clinic", {}).get("name", "?")
-        specialty = s.get("specialty", {}).get("name", "?")
+        doctor = (s.get("doctor") or {}).get("name", "?")
+        clinic = (s.get("clinic") or {}).get("name", "?")
+        specialty = (s.get("specialty") or {}).get("name", "?")
         bs = s.get("bookingString", "")[:40] + "..."
         print(f"\n  [{i}] {date}")
         print(f"      Lekarz: {doctor} | {specialty}")
@@ -231,7 +231,7 @@ def cmd_monitor(args):
             current_keys = set()
             new_slots = []
             for s in filtered:
-                key = f"{s.get('appointmentDate')}:{s.get('doctor', {}).get('name', '')}"
+                key = f"{s.get('appointmentDate')}:{(s.get('doctor') or {}).get('name', '')}"
                 current_keys.add(key)
                 if key not in known_slots:
                     new_slots.append(s)
@@ -242,9 +242,9 @@ def cmd_monitor(args):
                 print(f"{'='*70}")
                 for s in new_slots:
                     date = s.get("appointmentDate", "?")
-                    doc = s.get("doctor", {}).get("name", "?")
-                    clinic = s.get("clinic", {}).get("name", "?")
-                    spec = s.get("specialty", {}).get("name", "?")
+                    doc = (s.get("doctor") or {}).get("name", "?")
+                    clinic = (s.get("clinic") or {}).get("name", "?")
+                    spec = (s.get("specialty") or {}).get("name", "?")
                     print(f"  {date} | {doc} | {clinic} | {spec}")
 
                     if args.auto_book:
@@ -413,6 +413,7 @@ def main():
     p_login = sub.add_parser("login", help="Zaloguj się (Playwright)")
     p_login.add_argument("--card", help="Numer karty Medicover")
     p_login.add_argument("--password", help="Hasło")
+    p_login.add_argument("--relogin", action="store_true", help="Wyczyść zapisany stan przeglądarki i zaloguj od zera (nowe MFA)")
 
     # search
     p_search = sub.add_parser("search", help="Szukaj dostępnych slotów")

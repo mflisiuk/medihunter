@@ -10,6 +10,7 @@ OAUTH_URL = "https://oauth.medicover.pl"
 CLIENT_ID = "web"
 TOKEN_CACHE = Path.home() / ".config" / "medicover" / "tokens.json"
 CREDENTIALS_FILE = Path.home() / ".config" / "medicover" / "credentials.json"
+BROWSER_STATE_FILE = Path.home() / ".config" / "medicover" / "browser_state.json"
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
@@ -62,20 +63,29 @@ def refresh_access_token(refresh_token: str) -> dict:
     }
 
 
-def login_playwright(card_number: str, password: str, headless: bool = True) -> dict:
-    """Login via Playwright browser and capture tokens from response intercept."""
+def login_playwright(card_number: str, password: str, headless: bool = True, fresh: bool = False) -> dict:
+    """Login via Playwright browser and capture tokens from response intercept.
+
+    Saves browser cookies/localStorage after login so 'trusted device' persists.
+    Set fresh=True to ignore saved browser state and force a clean session.
+    """
     from playwright.sync_api import sync_playwright
 
     tokens: dict = {}
     login_host = "login-online24.medicover.pl"
     portal_home = "https://online24.medicover.pl/home"
 
+    if fresh and BROWSER_STATE_FILE.exists():
+        BROWSER_STATE_FILE.unlink()
+        print("[AUTH] Usunięto zapisany stan przeglądarki (fresh login)")
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
-        context = browser.new_context(
-            user_agent=USER_AGENT,
-            locale="pl-PL",
-        )
+        ctx_kwargs = {"user_agent": USER_AGENT, "locale": "pl-PL"}
+        if BROWSER_STATE_FILE.exists():
+            ctx_kwargs["storage_state"] = str(BROWSER_STATE_FILE)
+            print("[AUTH] Wczytano zapisany stan przeglądarki (cookies/localStorage)")
+        context = browser.new_context(**ctx_kwargs)
         page = context.new_page()
 
         def on_response(resp):
@@ -331,6 +341,14 @@ def login_playwright(card_number: str, password: str, headless: bool = True) -> 
             except Exception:
                 pass
 
+        # Save browser state (cookies + localStorage) so trusted device persists
+        try:
+            BROWSER_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            context.storage_state(path=str(BROWSER_STATE_FILE))
+            print("[AUTH] Zapisano stan przeglądarki (zaufane urządzenie zapamiętane)")
+        except Exception as e:
+            print(f"[AUTH] Nie udało się zapisać stanu przeglądarki: {e}")
+
         browser.close()
 
     if not tokens:
@@ -370,7 +388,7 @@ def get_valid_token() -> str:
         )
 
     print("[AUTH] Logowanie przez Playwright...")
-    new_tokens = login_playwright(creds["card_number"], creds["password"])
+    new_tokens = login_playwright(creds["card_number"], creds["password"], fresh=False)
     _save_tokens(new_tokens)
     print("[AUTH] Login successful, tokens cached")
     return new_tokens["access_token"]
@@ -389,7 +407,7 @@ def save_credentials(card_number: str, password: str):
     print(f"[AUTH] Credentials saved to {CREDENTIALS_FILE}")
 
 
-def force_login():
+def force_login(fresh: bool = False):
     """Force a full Playwright login, ignoring cached tokens."""
     creds = _load_credentials()
     if not creds:
@@ -398,6 +416,6 @@ def force_login():
         save_credentials(card, pwd)
         creds = _load_credentials()
 
-    tokens = login_playwright(creds["card_number"], creds["password"], headless=False)
+    tokens = login_playwright(creds["card_number"], creds["password"], headless=False, fresh=fresh)
     _save_tokens(tokens)
     print("[AUTH] Force login successful")

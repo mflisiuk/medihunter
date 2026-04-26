@@ -141,7 +141,7 @@ def filter_slots(
 
         # Doctor filter
         if doctor_name:
-            doc_name = s.get("doctor", {}).get("name", "")
+            doc_name = (s.get("doctor") or {}).get("name", "")
             if doctor_name.lower() not in doc_name.lower():
                 continue
 
