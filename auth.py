@@ -113,9 +113,57 @@ def login_playwright(card_number: str, password: str, headless: bool = True, fre
         page.on("response", on_response)
         page.goto(portal_home, wait_until="domcontentloaded", timeout=30000)
 
-        # Wait for redirect to login page
+        # If cookies are valid, portal loads directly (no redirect to login host)
+        # Wait briefly for a silent token refresh to fire
+        if login_host not in page.url:
+            page.wait_for_timeout(3000)
+            if tokens:
+                print("[AUTH] Sesja z ciasteczek — token przechwycony z odświeżenia")
+            else:
+                # Try localStorage before falling back to full login
+                try:
+                    storage = page.evaluate("""() => {
+                        for (let i = 0; i < localStorage.length; i++) {
+                            const key = localStorage.key(i);
+                            if (key.includes('oidc') && key.includes('web')) {
+                                try {
+                                    const val = JSON.parse(localStorage.getItem(key));
+                                    if (val.access_token && val.refresh_token) return val;
+                                } catch(e) {}
+                            }
+                        }
+                        return null;
+                    }""")
+                    if storage and storage.get("access_token"):
+                        tokens = {
+                            "access_token": storage["access_token"],
+                            "refresh_token": storage.get("refresh_token", ""),
+                            "expires_in": storage.get("expires_in"),
+                            "scope": storage.get("scope"),
+                            "token_type": "Bearer",
+                            "captured_at": int(time.time()),
+                        }
+                        print("[AUTH] Sesja z ciasteczek — token z localStorage")
+                except Exception:
+                    pass
+
+            if tokens:
+                # Save updated browser state and return early
+                try:
+                    BROWSER_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+                    context.storage_state(path=str(BROWSER_STATE_FILE))
+                except Exception:
+                    pass
+                browser.close()
+                return tokens
+
+            # Cookies expired — navigate to login manually
+            print("[AUTH] Ciasteczka wygasły, przekierowuję do loginu...")
+            page.goto(f"https://{login_host}/", wait_until="domcontentloaded", timeout=30000)
+
+        # Wait for redirect to login page (fresh session path)
         try:
-            page.wait_for_url(f"**://{login_host}/**", timeout=30000)
+            page.wait_for_url(f"**://{login_host}/**", timeout=15000)
         except Exception:
             browser.close()
             raise RuntimeError(f"Did not redirect to login host. URL: {page.url}")
