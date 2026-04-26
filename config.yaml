@@ -1,0 +1,12 @@
+region: 204
+
+monitoring_profiles:
+  fizjo_markiewicz:
+    doctor: "Marcin Markiewicz"
+    specialty: "Ortopedia i fizjoterapia"
+    date_from: "2026-04-27"
+    date_to: "2026-05-15"
+    time_from: "08:00"
+    time_to: "12:00"
+    interval: 1800
+    auto_book: true
