@@ -416,6 +416,6 @@ def force_login(fresh: bool = False):
         save_credentials(card, pwd)
         creds = _load_credentials()
 
-    tokens = login_playwright(creds["card_number"], creds["password"], headless=False, fresh=fresh)
+    tokens = login_playwright(creds["card_number"], creds["password"], headless=True, fresh=fresh)
     _save_tokens(tokens)
     print("[AUTH] Force login successful")
