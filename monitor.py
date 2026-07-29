@@ -313,7 +313,7 @@ def cmd_my_visits(args):
             print("  Brak wizyt.")
             return
         for v in items:
-            date = v.get("appointmentDate") or v.get("appointmentDateTime") or "?"
+            date = v.get("date") or v.get("appointmentDate") or v.get("appointmentDateTime") or "?"
             if "T" in str(date):
                 date = str(date).replace("T", " ")[:16]
             doctor = v.get("doctor", {}).get("name", v.get("doctorName", "?"))

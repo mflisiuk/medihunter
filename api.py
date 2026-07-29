@@ -1,7 +1,6 @@
 """Medicover Online24 API client — pure requests-based."""
 
-from datetime import datetime
-from urllib.parse import quote
+from datetime import datetime, timedelta
 
 import requests
 
@@ -44,6 +43,21 @@ class MedicoverAPI:
         except Exception:
             return {"status": resp.status_code, "raw": resp.text[:500]}
 
+    def _post(self, endpoint: str, params: dict | None = None, json: dict | None = None) -> dict | list:
+        url = f"{API_BASE}{endpoint}"
+        resp = self.session.post(
+            url,
+            params=params,
+            json=json,
+            headers=self._headers(),
+            timeout=30,
+        )
+        resp.raise_for_status()
+        try:
+            return resp.json()
+        except Exception:
+            return {"status": resp.status_code, "raw": resp.text[:500]}
+
     def search_slots(
         self,
         region_id: int = 204,
@@ -69,6 +83,10 @@ class MedicoverAPI:
         if start_date:
             params["StartTime"] = start_date
         if end_date:
+            if start_date and end_date <= start_date:
+                end_date = (
+                    datetime.strptime(start_date, "%Y-%m-%d") + timedelta(days=1)
+                ).strftime("%Y-%m-%d")
             params["EndTime"] = end_date
         params["isOverbookingSearchDisabled"] = "false"
 
@@ -76,13 +94,14 @@ class MedicoverAPI:
 
     def book_appointment(self, booking_string: str) -> dict:
         """Book an appointment using the bookingString from a slot."""
-        endpoint = (
-            f"/appointments/api/v2/search-appointments/book-appointment"
-            f"?bookingString={quote(booking_string)}"
-            f"&source=direct"
-            f"&searchTypeToUse=Standard"
+        return self._post(
+            "/appointments/api/v2/search-appointments/book-appointment",
+            json={
+                "bookingString": booking_string,
+                "source": "direct",
+                "searchTypeToUse": "Standard",
+            },
         )
-        return self._get(endpoint)
 
     def get_my_visits(self, state: str = "Planned", page: int = 1, page_size: int = 20) -> dict:
         """Get your appointments."""

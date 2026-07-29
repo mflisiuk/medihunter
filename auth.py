@@ -170,6 +170,15 @@ def login_playwright(card_number: str, password: str, headless: bool = True, fre
 
         page.wait_for_timeout(2000)
 
+        # Medicover may show a delayed "what's new" modal over the login form.
+        try:
+            close_welcome = page.locator('button:has-text("Zamknij")')
+            close_welcome.wait_for(state="visible", timeout=10000)
+            close_welcome.first.click(force=True, timeout=5000)
+            print("[AUTH] Zamknięto modal powitalny")
+        except Exception:
+            pass
+
         # Dismiss cookie consent
         for sel in ['#cmpwelcomebtnyes', 'button:has-text("Akceptuję")', '.cmpboxbtnyes']:
             try:
@@ -188,7 +197,7 @@ def login_playwright(card_number: str, password: str, headless: bool = True, fre
 
         # Fill login form
         user_filled = False
-        for sel in ['input[name="Input.Username"]', 'input#Input_Username', 'input[type="text"]']:
+        for sel in ['#usernameInput', 'input[name="Input.Username"]', 'input#Input_Username', 'input[type="text"]']:
             try:
                 loc = page.locator(sel)
                 if loc.count() > 0 and loc.first.is_visible():
@@ -204,7 +213,7 @@ def login_playwright(card_number: str, password: str, headless: bool = True, fre
 
         # Try password field
         pass_filled = False
-        for sel in ['input[name="Input.Password"]', 'input#Input_Password', 'input[type="password"]']:
+        for sel in ['#passwordInput', 'input[name="Input.Password"]', 'input#Input_Password', 'input[type="password"]']:
             try:
                 loc = page.locator(sel)
                 if loc.count() > 0 and loc.first.is_visible():
@@ -215,16 +224,23 @@ def login_playwright(card_number: str, password: str, headless: bool = True, fre
                 continue
 
         # Submit
-        for sel in ['button[type="submit"]', 'button:has-text("Zaloguj")', 'button:has-text("Dalej")']:
+        submitted_selector = None
+        for sel in ['#login-button', 'button[type="submit"]', 'button:has-text("Zaloguj")', 'button:has-text("Dalej")']:
             try:
                 loc = page.locator(sel)
                 if loc.count() > 0 and loc.first.is_visible():
-                    loc.first.click()
+                    loc.first.click(force=True, timeout=5000)
+                    submitted_selector = sel
                     break
             except Exception:
                 continue
         else:
             page.keyboard.press("Enter")
+            submitted_selector = "Enter"
+        print(
+            f"[AUTH] Formularz: login={'OK' if user_filled else 'BRAK'}, "
+            f"hasło={'OK' if pass_filled else 'DRUGI KROK'}, wysłanie={submitted_selector}"
+        )
 
         # If 2-step login, wait for password field
         if not pass_filled:
@@ -397,10 +413,24 @@ def login_playwright(card_number: str, password: str, headless: bool = True, fre
         except Exception as e:
             print(f"[AUTH] Nie udało się zapisać stanu przeglądarki: {e}")
 
+        failure_context = None
+        if not tokens:
+            debug_dir = Path.home() / ".config" / "medicover" / "debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                page.screenshot(path=str(debug_dir / "login_failure.png"), full_page=True)
+                (debug_dir / "login_failure.html").write_text(page.content())
+                failure_context = f"{page.url} ({page.title()!r}); diagnostyka: {debug_dir}"
+            except Exception:
+                failure_context = f"diagnostyka niedostępna: {debug_dir}"
+
         browser.close()
 
     if not tokens:
-        raise RuntimeError("Nie udało się przechwycić tokenów. Możliwe MFA/captcha lub zmieniony flow.")
+        raise RuntimeError(
+            "Nie udało się przechwycić tokenów. "
+            f"Końcowy ekran: {failure_context}"
+        )
 
     return tokens
 
