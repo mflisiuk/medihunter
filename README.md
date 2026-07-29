@@ -21,6 +21,24 @@ Po pierwszym logowaniu tokeny odświeżają się automatycznie (refresh_token) �
 
 ## Użycie
 
+### Profile kont
+
+Każde konto ma osobne poświadczenia, tokeny, stan przeglądarki i wyniki
+wyszukiwania w `~/.config/medicover/profiles/<nazwa>/`. Domyślnym profilem
+jest `michal`.
+
+```bash
+python3 monitor.py --account michal my-visits
+python3 monitor.py --account ewelina search --specialty-id 9
+python3 monitor.py --account ewelina login
+```
+
+Profil można też wybrać zmienną środowiskową:
+
+```bash
+MEDICOVER_ACCOUNT=ewelina python3 monitor.py my-visits
+```
+
 ### Szukanie wizyt
 
 ```bash
@@ -156,6 +174,7 @@ requirements.txt     — Zależności
 
 ## Dane
 
-Poświadczenia i tokeny przechowywane lokalnie w `~/.config/medicover/`:
+Poświadczenia i tokeny przechowywane lokalnie w
+`~/.config/medicover/profiles/<nazwa>/`:
 - `credentials.json` — numer karty + hasło
 - `tokens.json` — OAuth2 tokeny (auto-odświeżane)

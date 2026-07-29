@@ -1,6 +1,8 @@
 """Medicover Online24 authentication — refresh_token + Playwright login fallback."""
 
 import json
+import os
+import re
 import time
 from pathlib import Path
 
@@ -8,11 +10,34 @@ import requests
 
 OAUTH_URL = "https://oauth.medicover.pl"
 CLIENT_ID = "web"
-TOKEN_CACHE = Path.home() / ".config" / "medicover" / "tokens.json"
-CREDENTIALS_FILE = Path.home() / ".config" / "medicover" / "credentials.json"
-BROWSER_STATE_FILE = Path.home() / ".config" / "medicover" / "browser_state.json"
+CONFIG_ROOT = Path.home() / ".config" / "medicover"
+DEFAULT_ACCOUNT = "michal"
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+
+def set_account(name: str):
+    """Select an isolated account profile for credentials, tokens and browser state."""
+    normalized = name.strip().lower()
+    if not re.fullmatch(r"[a-z0-9_-]+", normalized):
+        raise ValueError("Nazwa konta może zawierać tylko litery a-z, cyfry, _ i -")
+
+    global ACCOUNT, ACCOUNT_DIR, TOKEN_CACHE, CREDENTIALS_FILE, BROWSER_STATE_FILE
+    ACCOUNT = normalized
+    ACCOUNT_DIR = CONFIG_ROOT / "profiles" / ACCOUNT
+    ACCOUNT_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    ACCOUNT_DIR.chmod(0o700)
+    TOKEN_CACHE = ACCOUNT_DIR / "tokens.json"
+    CREDENTIALS_FILE = ACCOUNT_DIR / "credentials.json"
+    BROWSER_STATE_FILE = ACCOUNT_DIR / "browser_state.json"
+
+
+def account_path(filename: str) -> Path:
+    """Return a data path isolated to the currently selected account."""
+    return ACCOUNT_DIR / filename
+
+
+set_account(os.environ.get("MEDICOVER_ACCOUNT", DEFAULT_ACCOUNT))
 
 
 def _load_tokens() -> dict | None:
@@ -25,6 +50,7 @@ def _save_tokens(tokens: dict):
     TOKEN_CACHE.parent.mkdir(parents=True, exist_ok=True)
     tmp = TOKEN_CACHE.with_suffix(".tmp")
     tmp.write_text(json.dumps(tokens, ensure_ascii=False, indent=2))
+    tmp.chmod(0o600)
     tmp.replace(TOKEN_CACHE)
 
 
@@ -152,6 +178,7 @@ def login_playwright(card_number: str, password: str, headless: bool = True, fre
                 try:
                     BROWSER_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
                     context.storage_state(path=str(BROWSER_STATE_FILE))
+                    BROWSER_STATE_FILE.chmod(0o600)
                 except Exception:
                     pass
                 browser.close()
@@ -280,7 +307,7 @@ def login_playwright(card_number: str, password: str, headless: bool = True, fre
                 print("\n[MFA] Wymagane uwierzytelnienie wieloskładnikowe (SMS).")
 
                 # Debug: save screenshot and HTML of MFA page
-                debug_dir = Path.home() / ".config" / "medicover" / "debug"
+                debug_dir = account_path("debug")
                 debug_dir.mkdir(parents=True, exist_ok=True)
                 try:
                     page.screenshot(path=str(debug_dir / "mfa_page.png"), full_page=True)
@@ -409,13 +436,14 @@ def login_playwright(card_number: str, password: str, headless: bool = True, fre
         try:
             BROWSER_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
             context.storage_state(path=str(BROWSER_STATE_FILE))
+            BROWSER_STATE_FILE.chmod(0o600)
             print("[AUTH] Zapisano stan przeglądarki (zaufane urządzenie zapamiętane)")
         except Exception as e:
             print(f"[AUTH] Nie udało się zapisać stanu przeglądarki: {e}")
 
         failure_context = None
         if not tokens:
-            debug_dir = Path.home() / ".config" / "medicover" / "debug"
+            debug_dir = account_path("debug")
             debug_dir.mkdir(parents=True, exist_ok=True)
             try:
                 page.screenshot(path=str(debug_dir / "login_failure.png"), full_page=True)

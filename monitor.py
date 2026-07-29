@@ -16,10 +16,9 @@ import random
 import sys
 import time
 from datetime import datetime
-from pathlib import Path
 
 from api import MedicoverAPI, filter_slots
-from auth import force_login, save_credentials
+from auth import account_path, force_login, save_credentials, set_account
 from config import find_specialty_name, get_profile, load_specialty_map, resolve_specialty_ids, load_config
 
 
@@ -123,9 +122,10 @@ def cmd_search(args):
 
     # Save for later booking
     if filtered:
-        slots_file = Path.home() / ".config" / "medicover" / "last_search.json"
+        slots_file = account_path("last_search.json")
         slots_file.parent.mkdir(parents=True, exist_ok=True)
         slots_file.write_text(json.dumps(filtered, indent=2, ensure_ascii=False))
+        slots_file.chmod(0o600)
         print(f"\n[✓] Sloty zapisane do {slots_file}")
 
 
@@ -282,7 +282,7 @@ def cmd_book(args):
     booking_string = args.booking_string
     if not booking_string:
         # Try first slot from last search
-        slots_file = Path.home() / ".config" / "medicover" / "last_search.json"
+        slots_file = account_path("last_search.json")
         if slots_file.exists():
             slots = json.loads(slots_file.read_text())
             if slots:
@@ -407,6 +407,10 @@ def main():
         description="Medicover Smart Monitor — szukaj, monitoruj, rezerwuj wizyty",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    parser.add_argument(
+        "--account",
+        help="Profil konta Medicover (default: MEDICOVER_ACCOUNT lub michal)",
+    )
     sub = parser.add_subparsers(dest="command")
 
     # login
@@ -461,6 +465,8 @@ def main():
     p_filters.add_argument("--region", type=int, help="Region ID")
 
     args = parser.parse_args()
+    if args.account:
+        set_account(args.account)
 
     if not args.command:
         parser.print_help()
