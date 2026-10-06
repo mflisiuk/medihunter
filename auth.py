@@ -56,8 +56,8 @@ def _save_tokens(tokens: dict):
 
 def _is_token_valid(tokens: dict) -> bool:
     """Check if access_token is still within its lifetime (with 15s buffer)."""
-    captured = tokens.get("captured_at", 0)
-    expires_in = tokens.get("expires_in", 180)
+    captured = tokens.get("captured_at") or 0
+    expires_in = tokens.get("expires_in") or 180  # localStorage token may lack expires_in
     return time.time() < captured + expires_in - 15
 
 
